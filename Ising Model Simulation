@@ -1,0 +1,265 @@
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+import pandas as pd
+from pathlib import Path
+from numba import jit
+from numpy.random import random
+
+# ========== Configure Simulation Parameters Here ==========
+PKA_ENERGY_VALUES = [4900, 5000, 5100, 5200, 5300, 5400, 5500, 5600, 5700, 5800, 5900, 6000, 6100, 6200, 6300, 6400, 6500, 6600, 6700, 6800, 6900, 7000, 7100, 7200, 7300, 7400, 7500]  # List of PKA energies to simulate
+# PKA_ENERGY_VALUES = [7600, 7700]  # List of PKA energies to simulate
+DIFFUSIVITY_VALUES = [9.5, 10.0]  # List of thermal diffusivity values to simulate
+H0_VALUE = 0.08  # Fixed demagnetizing field strength
+N_RUNS = 25  # Number of times to run each simulation
+# ======================================================
+
+@dataclass
+class SimulationParams:
+    """Parameters for radiation damage simulation"""
+    L: int = 150              # Lattice size from paper's figures
+    J: float = 1.0            # Exchange energy (units set scale)
+    kB: float = 1.0           # Boltzmann constant
+    T0: float = 1.82          # Initial temperature
+    T1: float = 4000          # PKA energy (will be set for each run)
+    H0: float = H0_VALUE      # Demagnetizing field strength (fixed)
+    Th: float = 2.0           # Temperature threshold
+    a: float = 3.0            # Thermal diffusivity (variable)
+    dt_initial: float = 0.1   # Time step for first 1000 steps after PKA
+    dt_final: float = 1.0     # Time step after first 1000 steps
+    dt_switch_step: int = 1000  # When to switch time steps
+    MC_STEPS: int = 50000     # Total Monte Carlo steps
+    PKA_STEP: int = 20000     # Step at which to introduce PKA
+    MEASUREMENT_INTERVAL: int = 100  # Steps between measurements
+
+@jit(nopython=True)
+def calculate_local_field(lattice, i, j, T, step, L, J, H0, Th, PKA_STEP):
+    """Calculate total local field from Hamiltonian"""
+    neighbors = (lattice[(i+1)%L,j] + lattice[i,(j+1)%L] + 
+                lattice[(i-1)%L,j] + lattice[i,(j-1)%L])
+    H_exchange = J * neighbors
+    B = H0 if (step >= PKA_STEP and T > Th) else 0.0
+    return H_exchange + B
+
+@jit(nopython=True)
+def update_temperature_map(temperature_map, t, step, L, T0, T1, a, PKA_STEP, x0, y0):
+    """Update temperature distribution according to equation 3"""
+    if step < PKA_STEP:
+        temperature_map.fill(T0)
+        return temperature_map
+    
+    if t == 0:
+        temperature_map.fill(T0)
+        return temperature_map
+        
+    for i in range(L):
+        for j in range(L):
+            r2 = (i-x0)**2 + (j-y0)**2
+            temperature_map[i,j] = T0 + ((T1 - T0)/(4*np.pi*a*t) * 
+                                       np.exp(-r2/(4*a*t)))
+    return temperature_map
+
+@jit(nopython=True)
+def run_monte_carlo_step(lattice, temperature_map, step, L, J, kB, H0, Th, PKA_STEP):
+    """Metropolis algorithm implementation"""
+    for _ in range(L*L):
+        i, j = int(random() * L), int(random() * L)
+        T = temperature_map[i,j]
+        
+        H_local = calculate_local_field(lattice, i, j, T, step, L, J, H0, Th, PKA_STEP)
+        dE = 2 * lattice[i,j] * H_local
+        
+        if dE <= 0 or random() < np.exp(-dE/(kB*T)):
+            lattice[i,j] *= -1
+
+def simulate_radiation_damage(params: SimulationParams) -> pd.DataFrame:
+    """Main simulation function"""
+    lattice = -np.ones((params.L, params.L))
+    temperature_map = np.full((params.L, params.L), params.T0)
+    
+    n_measurements = params.MC_STEPS // params.MEASUREMENT_INTERVAL + 1
+    times = np.zeros(n_measurements)
+    magnetizations = np.zeros(n_measurements)
+    
+    x0, y0 = params.L//2, params.L//2
+    t = 0.0
+    measurement_idx = 0
+    
+    print(f"\nRunning simulation with T1={params.T1}, a={params.a}, H0={params.H0}")
+    print(f"Lattice size: {params.L}x{params.L}")
+    
+    for step in range(params.MC_STEPS):
+        if step >= params.PKA_STEP:
+            dt = (params.dt_initial if (step - params.PKA_STEP) < params.dt_switch_step 
+                 else params.dt_final)
+            t += dt
+            temperature_map = update_temperature_map(
+                temperature_map, t, step, params.L, params.T0, params.T1, 
+                params.a, params.PKA_STEP, x0, y0)
+        
+        run_monte_carlo_step(
+            lattice, temperature_map, step, params.L, params.J, params.kB,
+            params.H0, params.Th, params.PKA_STEP)
+        
+        if step % params.MEASUREMENT_INTERVAL == 0:
+            times[measurement_idx] = step
+            magnetizations[measurement_idx] = np.mean(lattice)
+            measurement_idx += 1
+            # if step % (params.MEASUREMENT_INTERVAL * 10) == 0:
+            #     print(f"Progress: {step/params.MC_STEPS*100:.1f}%")
+    
+    return pd.DataFrame({
+        'Time': times[:measurement_idx],
+        'Magnetization': magnetizations[:measurement_idx]
+    })
+
+def plot_magnetization_curves(all_results, pka_energy: int, params: SimulationParams):
+    """Plot magnetization curves for all runs with color-coded diffusivity values"""
+    plt.figure(figsize=(12, 8))
+    
+    # Define color schemes for each diffusivity value
+    # Cool colors (blues) for first diffusivity
+    cool_colors = ['#000080', '#0000FF', '#4169E1', '#1E90FF', '#87CEEB']
+    # Warm colors (reds/oranges) for second diffusivity
+    warm_colors = ['#8B0000', '#FF0000', '#FF4500', '#FF6347', '#FFA07A']
+    
+    # Plot each run for each diffusivity value
+    for run_idx in range(N_RUNS):
+        # First diffusivity value - cool colors
+        plt.plot(all_results[run_idx][DIFFUSIVITY_VALUES[0]]['Time'],
+                all_results[run_idx][DIFFUSIVITY_VALUES[0]]['Magnetization'],
+                color=cool_colors[run_idx % len(cool_colors)],
+                alpha=0.7,
+                label=f'a={DIFFUSIVITY_VALUES[0]}, Run {run_idx+1}')
+        
+        # Second diffusivity value - warm colors
+        plt.plot(all_results[run_idx][DIFFUSIVITY_VALUES[1]]['Time'],
+                all_results[run_idx][DIFFUSIVITY_VALUES[1]]['Magnetization'],
+                color=warm_colors[run_idx % len(warm_colors)],
+                alpha=0.7,
+                label=f'a={DIFFUSIVITY_VALUES[1]}, Run {run_idx+1}')
+    
+    plt.title(f'PKA Energy T1={pka_energy}, H0={params.H0}\nAll Runs')
+    plt.xlabel('Monte Carlo Steps')
+    plt.ylabel('Magnetization')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True)
+    plt.xlim(0, params.MC_STEPS)
+    plt.ylim(-1.1, 1.1)
+    
+    plt.tight_layout()
+    # Include diffusivity values and H0 in filename
+    diffusivity_str = '_'.join(f'a{a}' for a in DIFFUSIVITY_VALUES)
+    plt.savefig(f'3.1_{pka_energy}_H0_{H0_VALUE}_{diffusivity_str}_all_runs.png',
+                bbox_inches='tight')
+    plt.close()
+
+def save_results_to_csv(results_data, filename='without_1.59.csv'):
+    """Save or append simulation results to CSV file"""
+    # Add timestamp to new results
+    new_df = pd.DataFrame(results_data)
+    current_time = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    new_df['timestamp'] = current_time
+    
+    try:
+        # Try to read existing file
+        existing_df = pd.read_csv(filename)
+        
+        # Check if existing data has timestamp column
+        if 'timestamp' not in existing_df.columns:
+            # Add a placeholder timestamp for old data
+            existing_df['timestamp'] = 'pre-2024-02-18'
+        
+        # Combine existing and new data
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    except FileNotFoundError:
+        # If file doesn't exist, use new data only
+        combined_df = new_df
+    
+    # Sort the dataframe
+    combined_df = combined_df.sort_values(['timestamp', 'pka_energy', 'diffusivity', 'run'])
+    
+    # Save to CSV
+    combined_df.to_csv(filename, index=False)
+    print(f"\nResults saved to {filename}")
+    print(f"Total entries: {len(combined_df)}")
+    
+    # Print summary of data points per parameter combination and timestamp
+    summary = combined_df.groupby(['timestamp', 'pka_energy', 'diffusivity']).size()
+    print("\nRuns per parameter combination:")
+    print(summary)
+    
+    return combined_df
+
+def run_simulations():
+    """Run simulations for all PKA energies and diffusivity values and save results"""
+    # Create a list to store all results for CSV
+    results_data = []
+    
+    # Dictionary to store final magnetizations for each energy and diffusivity value
+    all_final_mags = {}
+    
+    for pka_energy in PKA_ENERGY_VALUES:
+        print(f"\n{'='*50}")
+        print(f"Starting simulations for PKA Energy (T1) = {pka_energy}")
+        print(f"Diffusivity values: {DIFFUSIVITY_VALUES}")
+        print(f"Fixed H0 value: {H0_VALUE}")
+        print(f"Number of runs per configuration: {N_RUNS}")
+        
+        # Dictionary to store final magnetizations for each diffusivity value
+        final_mags = {a: [] for a in DIFFUSIVITY_VALUES}
+        # List to store all results for plotting
+        all_results = []
+        
+        # Run simulations for this PKA energy
+        for run in range(N_RUNS):
+            print(f"\nRun {run + 1}/{N_RUNS}")
+            results = {}
+            
+            for diffusivity in DIFFUSIVITY_VALUES:
+                params = SimulationParams(T1=pka_energy, H0=H0_VALUE, a=diffusivity)
+                sim_results = simulate_radiation_damage(params)
+                results[diffusivity] = sim_results
+                
+                # Store final magnetization
+                final_mag = sim_results['Magnetization'].iloc[-1]
+                final_mags[diffusivity].append(final_mag)
+                
+                # Add result to CSV data
+                results_data.append({
+                    'pka_energy': pka_energy,
+                    'diffusivity': diffusivity,
+                    'h0': H0_VALUE,
+                    'run': run + 1,
+                    'final_magnetization': final_mag
+                })
+            
+            # Store results for this run
+            all_results.append(results)
+        
+        # Plot all results for this PKA energy
+        plot_magnetization_curves(all_results, pka_energy, 
+                                SimulationParams(T1=pka_energy, H0=H0_VALUE))
+        
+        # Calculate and print averages for this PKA energy
+        print(f"\nFinal Magnetization Averages for T1={pka_energy}:")
+        for diffusivity in DIFFUSIVITY_VALUES:
+            avg_mag = np.mean(final_mags[diffusivity])
+            std_mag = np.std(final_mags[diffusivity])
+            print(f"\nDiffusivity a = {diffusivity}:")
+            print(f"  Average final magnetization: {avg_mag:.4f}")
+            print(f"  Standard deviation: {std_mag:.4f}")
+            print(f"  Individual values: {[f'{x:.4f}' for x in final_mags[diffusivity]]}")
+        
+        all_final_mags[pka_energy] = final_mags
+    
+    # Save results to CSV using the new function
+    results_df = save_results_to_csv(results_data)
+    
+    return all_final_mags
+
+if __name__ == "__main__":
+    final_mags = run_simulations()
